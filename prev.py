@@ -1,3 +1,4 @@
+import numpy as np
 import tiktoken
 import torch
 import torch.nn as nn
@@ -33,7 +34,6 @@ def create_dataloader_v1(txt, batch_size=4, max_length=256,
 
     return dataloader
 
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False):
         super().__init__()
@@ -53,17 +53,22 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x):
         b, num_tokens, d_in = x.shape
 
-        keys = self.W_key(x)  
+        keys = self.W_key(x) 
         queries = self.W_query(x)
         values = self.W_value(x)
+
         keys = keys.view(b, num_tokens, self.num_heads, self.head_dim)
         values = values.view(b, num_tokens, self.num_heads, self.head_dim)
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
+
         keys = keys.transpose(1, 2)
         queries = queries.transpose(1, 2)
         values = values.transpose(1, 2)
-        attn_scores = queries @ keys.transpose(2, 3)  
+
+        attn_scores = queries @ keys.transpose(2, 3) 
+
         mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
+
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
         attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
@@ -127,18 +132,19 @@ class TransformerBlock(nn.Module):
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])
         self.norm2 = LayerNorm(cfg["emb_dim"])
-        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
+        self.drop_resid = nn.Dropout(cfg["drop_rate"])
 
     def forward(self, x):
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x) 
-        x = self.drop_shortcut(x)
-        x = x + shortcut  
+        x = self.att(x)  
+        x = self.drop_resid(x)
+        x = x + shortcut 
+
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x)
-        x = self.drop_shortcut(x)
+        x = self.drop_resid(x)
         x = x + shortcut  
 
         return x
@@ -175,51 +181,86 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
 
         with torch.no_grad():
             logits = model(idx_cond)
+
         logits = logits[:, -1, :]
 
-        idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+        idx_next = torch.argmax(logits, dim=-1, keepdim=True)  
 
         idx = torch.cat((idx, idx_next), dim=1) 
 
     return idx
 
+def assign(left, right):
+    if left.shape != right.shape:
+        raise ValueError(f"Shape mismatch. Left: {left.shape}, Right: {right.shape}")
+    return torch.nn.Parameter(torch.tensor(right))
 
-if __name__ == "__main__":
 
-    GPT_CONFIG_124M = {
-        "vocab_size": 50257,     # Vocabulary size
-        "context_length": 1024,  # Context length
-        "emb_dim": 768,          # Embedding dimension
-        "n_heads": 12,           # Number of attention heads
-        "n_layers": 12,          # Number of layers
-        "drop_rate": 0.1,        # Dropout rate
-        "qkv_bias": False        # Query-Key-Value bias
-    }
+def load_weights_into_gpt(gpt, params):
+    gpt.pos_emb.weight = assign(gpt.pos_emb.weight, params['wpe'])
+    gpt.tok_emb.weight = assign(gpt.tok_emb.weight, params['wte'])
 
-    torch.manual_seed(123)
-    model = GPTModel(GPT_CONFIG_124M)
-    model.eval() 
+    for b in range(len(params["blocks"])):
+        q_w, k_w, v_w = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["w"], 3, axis=-1)
+        gpt.trf_blocks[b].att.W_query.weight = assign(
+            gpt.trf_blocks[b].att.W_query.weight, q_w.T)
+        gpt.trf_blocks[b].att.W_key.weight = assign(
+            gpt.trf_blocks[b].att.W_key.weight, k_w.T)
+        gpt.trf_blocks[b].att.W_value.weight = assign(
+            gpt.trf_blocks[b].att.W_value.weight, v_w.T)
 
-    start_context = "Hello, I am"
+        q_b, k_b, v_b = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["b"], 3, axis=-1)
+        gpt.trf_blocks[b].att.W_query.bias = assign(
+            gpt.trf_blocks[b].att.W_query.bias, q_b)
+        gpt.trf_blocks[b].att.W_key.bias = assign(
+            gpt.trf_blocks[b].att.W_key.bias, k_b)
+        gpt.trf_blocks[b].att.W_value.bias = assign(
+            gpt.trf_blocks[b].att.W_value.bias, v_b)
 
-    tokenizer = tiktoken.get_encoding("gpt2")
-    encoded = tokenizer.encode(start_context)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)
+        gpt.trf_blocks[b].att.out_proj.weight = assign(
+            gpt.trf_blocks[b].att.out_proj.weight,
+            params["blocks"][b]["attn"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].att.out_proj.bias = assign(
+            gpt.trf_blocks[b].att.out_proj.bias,
+            params["blocks"][b]["attn"]["c_proj"]["b"])
 
-    print(f"\n{50*'='}\n{22*' '}IN\n{50*'='}")
-    print("\nInput text:", start_context)
-    print("Encoded input text:", encoded)
-    print("encoded_tensor.shape:", encoded_tensor.shape)
+        gpt.trf_blocks[b].ff.layers[0].weight = assign(
+            gpt.trf_blocks[b].ff.layers[0].weight,
+            params["blocks"][b]["mlp"]["c_fc"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[0].bias = assign(
+            gpt.trf_blocks[b].ff.layers[0].bias,
+            params["blocks"][b]["mlp"]["c_fc"]["b"])
+        gpt.trf_blocks[b].ff.layers[2].weight = assign(
+            gpt.trf_blocks[b].ff.layers[2].weight,
+            params["blocks"][b]["mlp"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[2].bias = assign(
+            gpt.trf_blocks[b].ff.layers[2].bias,
+            params["blocks"][b]["mlp"]["c_proj"]["b"])
 
-    out = generate_text_simple(
-        model=model,
-        idx=encoded_tensor,
-        max_new_tokens=10,
-        context_size=GPT_CONFIG_124M["context_length"]
-    )
-    decoded_text = tokenizer.decode(out.squeeze(0).tolist())
+        gpt.trf_blocks[b].norm1.scale = assign(
+            gpt.trf_blocks[b].norm1.scale,
+            params["blocks"][b]["ln_1"]["g"])
+        gpt.trf_blocks[b].norm1.shift = assign(
+            gpt.trf_blocks[b].norm1.shift,
+            params["blocks"][b]["ln_1"]["b"])
+        gpt.trf_blocks[b].norm2.scale = assign(
+            gpt.trf_blocks[b].norm2.scale,
+            params["blocks"][b]["ln_2"]["g"])
+        gpt.trf_blocks[b].norm2.shift = assign(
+            gpt.trf_blocks[b].norm2.shift,
+            params["blocks"][b]["ln_2"]["b"])
 
-    print(f"\n\n{50*'='}\n{22*' '}OUT\n{50*'='}")
-    print("\nOutput:", out)
-    print("Output length:", len(out[0]))
-    print("Output text:", decoded_text)
+    gpt.final_norm.scale = assign(gpt.final_norm.scale, params["g"])
+    gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
+    gpt.out_head.weight = assign(gpt.out_head.weight, params["wte"])
+
+def text_to_token_ids(text, tokenizer):
+    encoded = tokenizer.encode(text, allowed_special={'<|endoftext|>'})
+    encoded_tensor = torch.tensor(encoded).unsqueeze(0) 
+    return encoded_tensor
+
+def token_ids_to_text(token_ids, tokenizer):
+    flat = token_ids.squeeze(0) 
+    return tokenizer.decode(flat.tolist())
