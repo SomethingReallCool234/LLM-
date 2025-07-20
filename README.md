@@ -53,10 +53,6 @@ I started with the core theory and mechanics (tokenization, attention, transform
 | `alpaca_data.json`   | Large, real instruction dataset          |
 | `chat_corpus.txt`    | Model-ready chat data                    |
 
-## Key Learnings
+## Example Chatbot Output
 
-- Transformers are modular; coding blocks from scratch brings deep understanding.
-- Pretrained models plus good data make a practical chatbot.
-- GPU acceleration is essential for practical LLM work.
-- Open-source datasets unlock significant LLM potential.
-
+![Chatbot Demo Output](./chatbot-demo.png)
